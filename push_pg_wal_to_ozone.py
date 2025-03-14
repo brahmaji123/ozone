@@ -13,6 +13,7 @@ OZONE_ENDPOINT = 'http://your-ozone-endpoint:9878'  # Ozone endpoint
 OZONE_ACCESS_KEY = 'your_ozone_access_key'  # Ozone access key
 OZONE_SECRET_KEY = 'your_ozone_secret_key'  # Ozone secret key
 OZONE_BUCKET = 'your_ozone_bucket_name'  # Ozone bucket name
+OZONE_BASE_FOLDER = 'wal_backups'  # Base folder in the Ozone bucket
 
 # Logging configuration
 logging.basicConfig(
@@ -39,14 +40,15 @@ def get_date_from_wal_file(file_name):
     return datetime.fromtimestamp(modification_time).strftime('%Y-%m-%d')
 
 def upload_wal_file_to_ozone(file_name):
-    """Upload a WAL file to the Ozone bucket, organized by date."""
+    """Upload a WAL file to the Ozone bucket, organized by date under the base folder."""
     file_path = os.path.join(PG_WAL_DIRECTORY, file_name)
     date_folder = get_date_from_wal_file(file_name)
-    ozone_key = f"{date_folder}/{file_name}"  # Organize files by date in Ozone
+    # Include the base folder in the Ozone key
+    ozone_key = f"{OZONE_BASE_FOLDER}/{date_folder}/{file_name}"
 
     try:
         s3_client.upload_file(file_path, OZONE_BUCKET, ozone_key)
-        logger.info(f"Uploaded {file_name} to Ozone bucket {OZONE_BUCKET} under {date_folder}")
+        logger.info(f"Uploaded {file_name} to Ozone bucket {OZONE_BUCKET} under {ozone_key}")
         return True
     except (NoCredentialsError, EndpointConnectionError) as e:
         logger.error(f"Ozone cluster is down or inaccessible: {e}")
@@ -73,11 +75,12 @@ def retry_local_backup():
     for file_name in os.listdir(LOCAL_BACKUP_DIR):
         file_path = os.path.join(LOCAL_BACKUP_DIR, file_name)
         date_folder = get_date_from_wal_file(file_name)
-        ozone_key = f"{date_folder}/{file_name}"  # Organize files by date in Ozone
+        # Include the base folder in the Ozone key
+        ozone_key = f"{OZONE_BASE_FOLDER}/{date_folder}/{file_name}"
 
         try:
             s3_client.upload_file(file_path, OZONE_BUCKET, ozone_key)
-            logger.info(f"Uploaded {file_name} from local backup to Ozone bucket {OZONE_BUCKET} under {date_folder}")
+            logger.info(f"Uploaded {file_name} from local backup to Ozone bucket {OZONE_BUCKET} under {ozone_key}")
             os.remove(file_path)  # Remove the file after successful upload
         except (NoCredentialsError, EndpointConnectionError) as e:
             logger.error(f"Ozone cluster is still down: {e}")
@@ -88,8 +91,8 @@ def retry_local_backup():
 def delete_old_folders():
     """Delete date folders older than 7 days from the Ozone bucket."""
     try:
-        # List all objects in the bucket
-        response = s3_client.list_objects_v2(Bucket=OZONE_BUCKET, Delimiter='/')
+        # List all objects in the bucket under the base folder
+        response = s3_client.list_objects_v2(Bucket=OZONE_BUCKET, Prefix=OZONE_BASE_FOLDER + '/', Delimiter='/')
         if 'CommonPrefixes' not in response:
             return
 
@@ -100,7 +103,8 @@ def delete_old_folders():
         # Iterate through date folders and delete old ones
         for folder in response['CommonPrefixes']:
             folder_name = folder['Prefix'].rstrip('/')
-            folder_date = datetime.strptime(folder_name, '%Y-%m-%d')
+            folder_date_str = folder_name.split('/')[-1]  # Extract date from folder name
+            folder_date = datetime.strptime(folder_date_str, '%Y-%m-%d')
 
             if folder_date.strftime('%Y-%m-%d') < cutoff_date_str:
                 # Delete all files in the folder
