@@ -1,10 +1,10 @@
 ---
-- name: Update CM Services with Flexible Name Matching
+- name: Update CM Services Including Those Without roleConfigGroups
   hosts: cm_server
   vars_files:
     - ../inventories/production/group_vars/cm_servers.yml
   tasks:
-    # 1. Authentication (same as before)
+    # 1. Authentication
     - name: Get CM API auth token
       uri:
         url: "https://{{ cm_host }}:7183/api/v40/auth/signin"
@@ -24,7 +24,7 @@
         cm_api_token: "{{ auth_result.json.token }}"
       no_log: true
 
-    # 2. Enhanced service discovery with name normalization
+    # 2. Service discovery
     - name: Get cluster services
       uri:
         url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services"
@@ -36,47 +36,24 @@
       register: cluster_services
       no_log: true
 
-    - name: Normalize service names and create mapping
-      set_fact:
-        normalized_services: >-
-          {{
-            dict(cluster_services.json.items | 
-                 map('map', 'lower') |
-                 map('regex_replace', '-?\d*$', '') |
-                 map('join', '|') |
-                 list)
-          }}
-      no_log: true
-
-    # 3. Enhanced service configuration mapping
-    - name: Set service password mapping
+    # 3. Service configuration mapping
+    - name: Set service configuration mapping
       set_fact:
         service_config_map: {
-          'hive': {'config_key': 'hive_metastore_database_password', 'password': '{{ primary_db_password }}', 'role_group': 'hive-HIVEMETASTORE-BASE'},
-          'hue': {'config_key': 'database_password', 'password': '{{ primary_db_password }}', 'role_group': 'hue-HUE_SERVER-BASE'},
-          'oozie': {'config_key': 'oozie_database_password', 'password': '{{ primary_db_password }}', 'role_group': 'oozie-OOZIE_SERVER-BASE'},
-          'yarn': {'config_key': 'yarn_resourcemanager_store_password', 'password': '{{ primary_db_password }}', 'role_group': 'yarn-RESOURCEMANAGER-BASE'},
-          'ranger': {'config_key': 'db_password', 'password': '{{ secondary_db_password }}', 'role_group': 'ranger-RANGER_ADMIN-BASE'},
-          'rangerkms': {'config_key': 'db_password', 'password': '{{ secondary_db_password }}', 'role_group': 'rangerkms-RANGER_KMS_SERVER-BASE'},
-          'nifiregistry': {'config_key': 'nifi.registry.db.password', 'password': '{{ secondary_db_password }}', 'role_group': 'nifiregistry-NIFI_REGISTRY_SERVER-BASE'}
+          'hive': {'type': 'service_level', 'config_key': 'hive_metastore_database_password', 'password': '{{ primary_db_password }}'},
+          'hue': {'type': 'service_level', 'config_key': 'database_password', 'password': '{{ primary_db_password }}'},
+          'ranger': {'type': 'service_level', 'config_key': 'db_password', 'password': '{{ secondary_db_password }}'},
+          'rangerkms': {'type': 'service_level', 'config_key': 'db_password', 'password': '{{ secondary_db_password }}'},
+          'yarn': {'type': 'role_level', 'config_key': 'yarn_resourcemanager_store_password', 'password': '{{ primary_db_password }}', 'role_group': 'yarn-RESOURCEMANAGER-BASE'},
+          'oozie': {'type': 'role_level', 'config_key': 'oozie_database_password', 'password': '{{ primary_db_password }}', 'role_group': 'oozie-OOZIE_SERVER-BASE'},
+          'nifiregistry': {'type': 'role_level', 'config_key': 'nifi.registry.db.password', 'password': '{{ secondary_db_password }}', 'role_group': 'nifiregistry-NIFI_REGISTRY_SERVER-BASE'}
         }
       no_log: true
 
-    # 4. Find matching services using normalized names
-    - name: Create service execution list
-      set_fact:
-        services_to_update: >-
-          {{
-            normalized_services | dict2items |
-            selectattr('value', 'in', service_config_map.keys()) |
-            map(attribute='key') | list
-          }}
-      no_log: true
-
-    # 5. Update configurations with original service names
-    - name: Update service configurations
+    # 4. Update services without roleConfigGroups (service level config)
+    - name: Update service-level configurations
       uri:
-        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item }}/roleConfigGroups/{{ service_config_map[normalized_services[item]].role_group }}/config"
+        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item.name }}/config"
         method: PUT
         headers:
           Authorization: "Bearer {{ cm_api_token }}"
@@ -84,41 +61,67 @@
         body_format: json
         body:
           items: [{
-            name: "{{ service_config_map[normalized_services[item]].config_key }}",
-            value: "{{ service_config_map[normalized_services[item]].password }}",
+            name: "{{ item.config.config_key }}",
+            value: "{{ item.config.password }}",
             sensitive: true
           }]
         validate_certs: no
         status_code: 200
-      loop: "{{ services_to_update }}"
+      loop: "{{ cluster_services.json.items | json_query(query) }}"
+      vars:
+        query: |
+          [?contains(['hive','hue','ranger','rangerkms'], to_lower(name))]
+          .{name: name, config: service_config_map::get(to_lower(name))}
       no_log: true
-      register: config_updates
+      register: service_level_updates
       retries: 3
       delay: 10
-      until: config_updates is succeeded
+      until: service_level_updates is succeeded
 
-    # 6. Enhanced Reports Manager check
-    - name: Check for Reports Manager
+    # 5. Update services with roleConfigGroups (role level config)
+    - name: Update role-level configurations
       uri:
-        url: "https://{{ cm_host }}:7183/api/v40/cm/service"
-        method: GET
+        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item.name }}/roleConfigGroups/{{ item.config.role_group }}/config"
+        method: PUT
         headers:
           Authorization: "Bearer {{ cm_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          items: [{
+            name: "{{ item.config.config_key }}",
+            value: "{{ item.config.password }}",
+            sensitive: true
+          }]
         validate_certs: no
         status_code: 200
-      register: cm_service
+      loop: "{{ cluster_services.json.items | json_query(query) }}"
+      vars:
+        query: |
+          [?contains(['yarn','oozie','nifiregistry'], to_lower(name))]
+          .{name: name, config: service_config_map::get(to_lower(name))}
       no_log: true
+      register: role_level_updates
+      retries: 3
+      delay: 10
+      until: role_level_updates is succeeded
 
-    - name: Set reports manager fact
-      set_fact:
-        reports_manager_exists: >-
-          {{
-            'REPORTSMANAGER' in (cm_service.json.roles | 
-                                 map(attribute='type') |
-                                 map('upper') |
-                                 list)
-          }}
+    # 6. Special handling for Queue Manager (YARN)
+    - name: Update YARN Queue Manager configuration
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item }}/config"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ cm_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          items: [{
+            name: "yarn_resourcemanager_store_password",
+            value: "{{ primary_db_password }}",
+            sensitive: true
+          }]
+        validate_certs: no
+        status_code: 200
+      loop: "{{ cluster_services.json.items | selectattr('name', 'match', '(?i)^yarn') | map(attribute='name') | list }}"
       no_log: true
-
-    # [Rest of the tasks remain the same as previous example]
-    # ... (restart tasks, etc)
