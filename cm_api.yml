@@ -1,5 +1,5 @@
 ---
-- name: Update Cloudera Manager Service Database Configs via API
+- name: Update Cloudera Manager Service DB Configs with Multiple Passwords
   hosts: cm_server
   vars_files:
     - ../inventories/production/group_vars/cm_servers.yml
@@ -23,9 +23,10 @@
         cm_api_token: "{{ auth_result.json.token }}"
       no_log: true
 
-    - name: Update service database passwords
+    # Group 1: Services using primary_db_password (Hive, Hue, Oozie, Reports Manager, YARN)
+    - name: Update primary password services
       uri:
-        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item.service }}/roleConfigGroups/{{ item.role_group }}/config"
+        url: "{{ item.url }}"
         method: PUT
         headers:
           Authorization: "Bearer {{ cm_api_token }}"
@@ -34,56 +35,44 @@
         body:
           items:
             - name: "{{ item.config_key }}"
-              value: "{{ db_password }}"
+              value: "{{ primary_db_password }}"
               sensitive: true
         validate_certs: no
         status_code: 200
       loop:
-        - { service: "hive", role_group: "hive-HIVESERVER2-BASE", config_key: "hive_database_password" }
-        - { service: "hue", role_group: "hue-HUE_SERVER-BASE", config_key: "database_password" }
-        - { service: "oozie", role_group: "oozie-OOZIE_SERVER-BASE", config_key: "oozie_database_password" }
-        - { service: "reportsmanager", role_group: "reportsmanager-REPORTSMANAGER_SERVER-BASE", config_key: "headlamp_database_password" }
-        - { service: "ranger", role_group: "ranger-RANGER_ADMIN-BASE", config_key: "db_password" }
-        - { service: "rangerkms", role_group: "rangerkms-RANGER_KMS_SERVER-BASE", config_key: "db_password" }
-        - { service: "nifiregistry", role_group: "nifiregistry-NIFI_REGISTRY_SERVER-BASE", config_key: "nifi.registry.db.password" }
-        - { service: "yarn", role_group: "yarn-RESOURCEMANAGER-BASE", config_key: "yarn_resourcemanager_store_password" }
+        - { url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/hive/roleConfigGroups/hive-HIVEMETASTORE-BASE/config", config_key: "hive_metastore_database_password" }
+        - { url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/hue/roleConfigGroups/hue-HUE_SERVER-BASE/config", config_key: "database_password" }
+        - { url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/oozie/roleConfigGroups/oozie-OOZIE_SERVER-BASE/config", config_key: "oozie_database_password" }
+        - { url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/yarn/roleConfigGroups/yarn-RESOURCEMANAGER-BASE/config", config_key: "yarn_resourcemanager_store_password" }
+        - { url: "https://{{ cm_host }}:7183/api/v40/cm/service/roleConfigGroups/reportsmanager-REPORTSMANAGER_SERVER-BASE/config", config_key: "headlamp_database_password" }
       no_log: true
-      register: config_updates
-      until: config_updates is succeeded
+      register: primary_updates
+      until: primary_updates is succeeded
       retries: 3
       delay: 10
 
-    - name: Restart affected services
+    # Group 2: Services using secondary_db_password (Ranger, Ranger KMS, NiFi Registry)
+    - name: Update secondary password services
       uri:
-        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item }}/commands/restart"
-        method: POST
+        url: "{{ item.url }}"
+        method: PUT
         headers:
           Authorization: "Bearer {{ cm_api_token }}"
           Content-Type: "application/json"
         body_format: json
-        body: {}
+        body:
+          items:
+            - name: "{{ item.config_key }}"
+              value: "{{ secondary_db_password }}"
+              sensitive: true
         validate_certs: no
         status_code: 200
       loop:
-        - hive
-        - hue
-        - oozie
-        - reportsmanager
-        - ranger
-        - rangerkms
-        - nifiregistry
-        - yarn
+        - { url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/ranger/roleConfigGroups/ranger-RANGER_ADMIN-BASE/config", config_key: "db_password" }
+        - { url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/rangerkms/roleConfigGroups/rangerkms-RANGER_KMS_SERVER-BASE/config", config_key: "db_password" }
+        - { url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/nifiregistry/roleConfigGroups/nifiregistry-NIFI_REGISTRY_SERVER-BASE/config", config_key: "nifi.registry.db.password" }
       no_log: true
-
-    - name: Restart Cloudera Management Service
-      uri:
-        url: "https://{{ cm_host }}:7183/api/v40/cm/service/commands/restart"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ cm_api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body: {}
-        validate_certs: no
-        status_code: 200
-      no_log: true
+      register: secondary_updates
+      until: secondary_updates is succeeded
+      retries: 3
+      delay: 10
