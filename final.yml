@@ -1,8 +1,12 @@
 ---
-- name: Update CM Services with Suffix Handling
+- name: Comprehensive Cloudera Manager Service Configuration Update
   hosts: cm_server
   vars_files:
     - ../inventories/production/group_vars/cm_servers.yml
+  vars:
+    primary_db_password: "{{ vault_primary_db_password }}"
+    secondary_db_password: "{{ vault_secondary_db_password }}"
+
   tasks:
     # 1. Authentication
     - name: Get CM API auth token
@@ -36,7 +40,7 @@
       register: cluster_services
       no_log: true
 
-    # 3. Normalize service names and create mapping
+    # 3. Normalize service names (handle hive-1, ranger_kms-1, etc.)
     - name: Create normalized service mapping
       set_fact:
         normalized_services: >-
@@ -46,14 +50,10 @@
                  map('regex_replace', '[-_]\\d+$', '') |
                  map('lower') |
                  zip(cluster_services.json.items | map(attribute='name')) |
-                 map('reverse') |
-                 map('list') |
-                 sum(start=[]) |
                  groupby(0) |
                  map('json_query', '[{key: [0], values: [1[].1]}]') |
                  sum(start=[]) |
                  items2dict
-            )
           }}
       no_log: true
 
@@ -72,51 +72,62 @@
         }
       no_log: true
 
-    # 5. Update service-level configurations (Hive, Hue, Ranger, Ranger KMS, YARN)
-    - name: Update service-level configurations
-      uri:
-        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item.original_name }}/config"
-        method: PUT
-        headers:
-          Authorization: "Bearer {{ cm_api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          items: [{
-            name: "{{ service_config_map[item.normalized_name].config_key }}",
-            value: "{{ service_config_map[item.normalized_name].password }}",
-            sensitive: true
-          }]
-        validate_certs: no
-        status_code: 200
-      loop: "{{ normalized_services | dict2items | selectattr('key', 'in', ['hive','hue','ranger','rangerkms','yarn']) | json_query('[].{original_name: value[0], normalized_name: key}') }}"
-      no_log: true
-      retries: 3
-      delay: 10
+    # 5. Update service configurations (skips missing services automatically)
+    - name: Update service configurations
+      block:
+        - name: Update service-level configs (Hive, Hue, Ranger, etc.)
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[service_type][0] }}/config"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              items: [{
+                name: "{{ service_config_map[service_type].config_key }}",
+                value: "{{ service_config_map[service_type].password }}",
+                sensitive: true
+              }]
+            validate_certs: no
+            status_code: 200
+          loop: "{{ ['hive','hue','ranger','rangerkms','yarn'] | select('in', normalized_services.keys()) | list }}"
+          loop_control:
+            loop_var: service_type
+          no_log: true
+          register: service_config_updates
+          retries: 3
+          delay: 10
 
-    # 6. Update role-level configurations (Oozie, NiFi Registry, SQL Stream Builder)
-    - name: Update role-level configurations
-      uri:
-        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item.original_name }}/roleConfigGroups/{{ service_config_map[item.normalized_name].role_group }}/config"
-        method: PUT
-        headers:
-          Authorization: "Bearer {{ cm_api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          items: [{
-            name: "{{ service_config_map[item.normalized_name].config_key }}",
-            value: "{{ service_config_map[item.normalized_name].password }}",
-            sensitive: true
-          }]
-        validate_certs: no
-        status_code: 200
-      loop: "{{ normalized_services | dict2items | selectattr('key', 'in', ['oozie','nifiregistry','sqlstreambuilder']) | json_query('[].{original_name: value[0], normalized_name: key}') }}"
-      no_log: true
-      retries: 3
-      delay: 10
+        - name: Update role-level configs (Oozie, NiFi, etc.)
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[service_type][0] }}/roleConfigGroups/{{ service_config_map[service_type].role_group }}/config"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              items: [{
+                name: "{{ service_config_map[service_type].config_key }}",
+                value: "{{ service_config_map[service_type].password }}",
+                sensitive: true
+              }]
+            validate_certs: no
+            status_code: 200
+          loop: "{{ ['oozie','nifiregistry','sqlstreambuilder'] | select('in', normalized_services.keys()) | list }}"
+          loop_control:
+            loop_var: service_type
+          no_log: true
+          register: role_config_updates
+          retries: 3
+          delay: 10
 
-    # 7. Handle Reports Manager (CM Service)
+      rescue:
+        - name: Log configuration errors
+          debug:
+            msg: "Error configuring {{ service_type }} - {{ ansible_failed_result.msg }}"
+          when: ansible_failed_result is defined
+
+    # 6. Handle Reports Manager (CM Service)
     - name: Check for Reports Manager
       uri:
         url: "https://{{ cm_host }}:7183/api/v40/cm/service"
@@ -147,35 +158,40 @@
       when: "'REPORTSMANAGER' in (cm_service.json.roles | map(attribute='type') | list)"
       no_log: true
 
-    # 8. Restart services
+    # 7. Restart services
     - name: Restart modified services
-      uri:
-        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item }}/commands/restart"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ cm_api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body: {}
-        validate_certs: no
-        status_code: 200
-      loop: "{{ cluster_services.json.items | map(attribute='name') | list }}"
-      when: >
-        (item | regex_replace('[-_]\\d+$', '') | lower in service_config_map.keys()) or
-        (item | regex_replace('[-_]\\d+$', '') | lower == 'reportsmanager')
-      no_log: true
+      block:
+        - name: Restart cluster services
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[service_type][0] }}/commands/restart"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body: {}
+            validate_certs: no
+            status_code: 200
+          loop: "{{ normalized_services.keys() | intersect(service_config_map.keys()) | list }}"
+          loop_control:
+            loop_var: service_type
+          no_log: true
 
-    - name: Restart Reports Manager if exists
-      uri:
-        url: "https://{{ cm_host }}:7183/api/v40/cm/service/commands/restart"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ cm_api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          serviceNames: ["reportsmanager"]
-        validate_certs: no
-        status_code: 200
-      when: "'REPORTSMANAGER' in (cm_service.json.roles | map(attribute='type') | list)"
-      no_log: true
+        - name: Restart Reports Manager
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/cm/service/commands/restart"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              serviceNames: ["reportsmanager"]
+            validate_certs: no
+            status_code: 200
+          when: "'REPORTSMANAGER' in (cm_service.json.roles | map(attribute='type') | list)"
+          no_log: true
+
+      rescue:
+        - name: Log restart failures
+          debug:
+            msg: "Failed to restart {{ service_type }} - {{ ansible_failed_result.msg }}"
+          when: ansible_failed_result is defined
