@@ -1,0 +1,89 @@
+---
+- name: Update Cloudera Manager Service Database Configs via API
+  hosts: cm_server
+  vars_files:
+    - ../inventories/production/group_vars/cm_servers.yml
+  tasks:
+    - name: Get CM API auth token
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/auth/signin"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ cm_admin_user }}"
+          password: "{{ cm_admin_password }}"
+        validate_certs: no
+        status_code: 200
+      register: auth_result
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set auth token
+      set_fact:
+        cm_api_token: "{{ auth_result.json.token }}"
+      no_log: true
+
+    - name: Update service database passwords
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item.service }}/roleConfigGroups/{{ item.role_group }}/config"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ cm_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          items:
+            - name: "{{ item.config_key }}"
+              value: "{{ db_password }}"
+              sensitive: true
+        validate_certs: no
+        status_code: 200
+      loop:
+        - { service: "hive", role_group: "hive-HIVESERVER2-BASE", config_key: "hive_database_password" }
+        - { service: "hue", role_group: "hue-HUE_SERVER-BASE", config_key: "database_password" }
+        - { service: "oozie", role_group: "oozie-OOZIE_SERVER-BASE", config_key: "oozie_database_password" }
+        - { service: "reportsmanager", role_group: "reportsmanager-REPORTSMANAGER_SERVER-BASE", config_key: "headlamp_database_password" }
+        - { service: "ranger", role_group: "ranger-RANGER_ADMIN-BASE", config_key: "db_password" }
+        - { service: "rangerkms", role_group: "rangerkms-RANGER_KMS_SERVER-BASE", config_key: "db_password" }
+        - { service: "nifiregistry", role_group: "nifiregistry-NIFI_REGISTRY_SERVER-BASE", config_key: "nifi.registry.db.password" }
+        - { service: "yarn", role_group: "yarn-RESOURCEMANAGER-BASE", config_key: "yarn_resourcemanager_store_password" }
+      no_log: true
+      register: config_updates
+      until: config_updates is succeeded
+      retries: 3
+      delay: 10
+
+    - name: Restart affected services
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ item }}/commands/restart"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cm_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: {}
+        validate_certs: no
+        status_code: 200
+      loop:
+        - hive
+        - hue
+        - oozie
+        - reportsmanager
+        - ranger
+        - rangerkms
+        - nifiregistry
+        - yarn
+      no_log: true
+
+    - name: Restart Cloudera Management Service
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/cm/service/commands/restart"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cm_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: {}
+        validate_certs: no
+        status_code: 200
+      no_log: true
