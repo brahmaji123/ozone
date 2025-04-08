@@ -1,14 +1,19 @@
 - name: Create normalized service mapping
   set_fact:
     normalized_services: >-
-      {% set service_names = cluster_services.json.items | map(attribute='name') | list %}
-      {% set base_names = service_names | map('regex_replace', '[-_]\\d+$', '') | map('lower') | list %}
-      {{
-        dict(
-          base_names | zip(service_names) | 
-          groupby(0) | 
-          map('json_query', '[{key: [0], values: [1[].1]}]') | 
-          items2dict
-        )
+      {%
+        set services_list = cluster_services.json.items
+      %}{%
+        set ns = namespace(result={})
+      %}{%
+        for service in services_list
+      %}{%
+        set base_name = service.name | regex_replace('[-_]\\d+$', '') | lower
+      %}{%
+        if ns.result.update({base_name: ns.result.get(base_name, []) + [service.name]})
+      %}{% endif %}{%
+        endfor
+      %}{{
+        ns.result
       }}
   no_log: true
