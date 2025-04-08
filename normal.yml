@@ -1,16 +1,14 @@
-- name: Create normalized service mapping
+- name: Create normalized service mapping (fixed version)
   set_fact:
     normalized_services: >-
       {%
-        set services_list = cluster_services.json.items
-      %}{%
         set ns = namespace(result={})
       %}{%
-        for service in services_list
+        for item in cluster_services.json.get('items', [])
       %}{%
-        set base_name = service.name | regex_replace('[-_]\\d+$', '') | lower
+        set base_name = (item.name | default('')) | regex_replace('[-_]\\d+$', '') | lower
       %}{%
-        if ns.result.update({base_name: ns.result.get(base_name, []) + [service.name]})
+        if item.name is defined and ns.result.update({base_name: ns.result.get(base_name, []) + [item.name]})
       %}{% endif %}{%
         endfor
       %}{{
