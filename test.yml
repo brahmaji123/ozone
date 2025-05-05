@@ -1,0 +1,10 @@
+body:
+              items: "{{ service_configs | selectattr('type', 'equalto', 'service_level') | 
+                        map(attribute='config_key') | 
+                        zip(service_configs | selectattr('type', 'equalto', 'service_level') | 
+                            map(attribute='password')) |
+                        map('community.general.dict_kv', 'name', 'value') |
+                        map('combine', {'sensitive': true}) |
+                        list }}"
+            validate_certs: no
+            status_code: 200
