@@ -5,65 +5,100 @@
   vars:
     primary_db_password: "{{ vault_primary_db_password }}"
     secondary_db_password: "{{ vault_secondary_db_password }}"
-    ldap_bind_password: "{{ vault_ldap_bind_password }}"
 
   tasks:
-    # [Previous tasks remain the same until service_config_map]
-    
-    # 4. Service configuration mapping
+    # 1. Authentication
+    - name: Get CM API auth token
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/auth/signin"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ cm_admin_user }}"
+          password: "{{ cm_admin_password }}"
+        validate_certs: no
+        status_code: 200
+      register: auth_result
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set auth token
+      set_fact:
+        cm_api_token: "{{ auth_result.json.token }}"
+      no_log: true
+
+    # 2. Service discovery with suffix handling
+    - name: Get cluster services
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cm_api_token }}"
+        validate_certs: no
+        status_code: 200
+      register: cluster_services
+      no_log: true
+
+    - name: Create normalized service mapping
+      set_fact:
+        normalized_services: >-
+          {{
+            dict(cluster_services.json.items |
+                 map(attribute='name') |
+                 map('regex_replace', '[-_]\\d+$', '') |
+                 map('lower') |
+                 zip(cluster_services.json.items | map(attribute='name')) |
+                 groupby(0) |
+                 map('json_query', '[{key: [0], values: [1[].1]}]') |
+                 sum(start=[]) |
+                 items2dict
+          }}
+      no_log: true
+
+    # 3. Service configuration mapping (db_passwords)
     - name: Set service configuration mapping
       set_fact:
         service_config_map: {
           'hive': {'type': 'service_level', 'config_key': 'hive_metastore_database_password', 'password': '{{ primary_db_password }}'},
-          'hue': {
-            'type': 'service_level', 
-            'configs': [
-              {'key': 'database_password', 'value': '{{ primary_db_password }}'},
-              {'key': 'ldap_bind_password', 'value': '{{ ldap_bind_password }}'}
-            ]
-          },
-          'ranger': {
-            'service_level_configs': [
-              {'key': 'db_password', 'value': '{{ secondary_db_password }}'}
-            ],
-            'role_level_configs': {
-              'ranger-RANGER_ADMIN-BASE': [
-                {'key': 'ranger_ldap_bind_password', 'value': '{{ ldap_bind_password }}'}
-              ]
-            }
-          },
+          'hue': {'type': 'service_level', 'config_key': 'database_password', 'password': '{{ primary_db_password }}'},
+          'ranger': {'type': 'service_level', 'config_key': 'db_password', 'password': '{{ secondary_db_password }}'},
           'rangerkms': {'type': 'service_level', 'config_key': 'db_password', 'password': '{{ secondary_db_password }}'},
           'yarn': {'type': 'service_level', 'config_key': 'yarn_resourcemanager_store_password', 'password': '{{ primary_db_password }}'},
           'oozie': {'type': 'role_level', 'config_key': 'oozie_database_password', 'password': '{{ primary_db_password }}', 'role_group': 'oozie-OOZIE_SERVER-BASE'},
-          'nifi': {
-            'type': 'role_level', 
-            'role_group': 'nifi-NIFI_NODE-BASE',
-            'configs': [
-              {'key': 'nifi.security.identity.mapping.pattern.dn', 'value': 'CN=([^,]+)', 'sensitive': false},
-              {'key': 'nifi.security.identity.mapping.value.dn', 'value': '$1', 'sensitive': false},
-              {'key': 'nifi.security.identity.mapping.transform.dn', 'value': 'UPPER', 'sensitive': false},
-              {'key': 'nifi.security.user.login.identity.provider', 'value': 'ldap-provider', 'sensitive': false},
-              {'key': 'nifi.security.user.authorizer', 'value': 'managed-authorizer', 'sensitive': false},
-              {'key': 'nifi.security.user.ldap.bind.password', 'value': '{{ ldap_bind_password }}', 'sensitive': true}
-            ]
-          },
-          'nifiregistry': {
-            'type': 'role_level', 
-            'configs': [
-              {'key': 'nifi.registry.db.password', 'value': '{{ secondary_db_password }}'},
-              {'key': 'nifi.registry.security.identity.provider.ldap.bind.password', 'value': '{{ ldap_bind_password }}'}
-            ],
-            'role_group': 'nifiregistry-NIFI_REGISTRY_SERVER-BASE'
-          },
+          'nifiregistry': {'type': 'role_level', 'config_key': 'nifi.registry.db.password', 'password': '{{ secondary_db_password }}', 'role_group': 'nifiregistry-NIFI_REGISTRY_SERVER-BASE'},
           'sqlstreambuilder': {'type': 'role_level', 'config_key': 'spring.datasource.password', 'password': '{{ primary_db_password }}', 'role_group': 'sqlstreambuilder-SQL_STREAM_BUILDER_SERVER-BASE'}
         }
       no_log: true
 
-    # 5. Update service configurations
-    - name: Update service configurations
+    # 4. LDAP password config mapping
+    - name: Set LDAP bind password config map
+      set_fact:
+        ldap_password_config_map:
+          - service_key: ranger
+            role_group: ranger-RANGER_ADMIN-BASE
+            config_key: ranger_ldap_bind_password
+            password: "{{ secondary_db_password }}"
+          - service_key: atlas
+            role_group: atlas-ATLAS_SERVER-BASE
+            config_key: atlas_ldap_bind_password
+            password: "{{ secondary_db_password }}"
+          - service_key: nifiregistry
+            role_group: nifiregistry-NIFI_REGISTRY_SERVER-BASE
+            config_key: nifiregistry_ldap_bind_password
+            password: "{{ secondary_db_password }}"
+          - service_key: hue
+            type: service_level
+            config_key: ldap_bind_password
+            password: "{{ secondary_db_password }}"
+          - service_key: nifi
+            role_group: nifi-NIFI_NODE-BASE
+            config_key: nifi.security.user.ldap.password
+            password: "{{ secondary_db_password }}"
+
+    # 5. Update service & role configurations
+    - name: Update service and role configurations
       block:
-        # Standard service-level configs (Hive, Hue, Ranger DB password, etc.)
-        - name: Update service-level configs
+        - name: Update service-level configs (Hive, Hue, Ranger, etc.)
           uri:
             url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[service_type][0] }}/config"
             method: PUT
@@ -71,58 +106,21 @@
               Authorization: "Bearer {{ cm_api_token }}"
             body_format: json
             body:
-              items: >-
-                {% if service_config_map[service_type] is mapping and service_config_map[service_type].config_key is defined %}
-                  [{
-                    "name": "{{ service_config_map[service_type].config_key }}",
-                    "value": "{{ service_config_map[service_type].password }}",
-                    "sensitive": true
-                  }]
-                {% elif service_config_map[service_type].service_level_configs is defined %}
-                  {{ service_config_map[service_type].service_level_configs | 
-                     map('regex_replace', '^(true|false)$', '\1') | 
-                     list | 
-                     to_json }}
-                {% elif service_config_map[service_type].configs is defined %}
-                  {{ service_config_map[service_type].configs | 
-                     map('regex_replace', '^(true|false)$', '\1') | 
-                     list | 
-                     to_json }}
-                {% endif %}
+              items: [{
+                name: "{{ service_config_map[service_type].config_key }}",
+                value: "{{ service_config_map[service_type].password }}",
+                sensitive: true
+              }]
             validate_certs: no
             status_code: 200
           loop: "{{ ['hive','hue','ranger','rangerkms','yarn'] | select('in', normalized_services.keys()) | list }}"
           loop_control:
             loop_var: service_type
           no_log: true
-          register: service_config_updates
           retries: 3
           delay: 10
 
-        # Ranger role-level config (LDAP bind password)
-        - name: Update Ranger role-level LDAP config
-          uri:
-            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services['ranger'][0] }}/roleConfigGroups/ranger-RANGER_ADMIN-BASE/config"
-            method: PUT
-            headers:
-              Authorization: "Bearer {{ cm_api_token }}"
-            body_format: json
-            body:
-              items: >-
-                {{ service_config_map['ranger'].role_level_configs['ranger-RANGER_ADMIN-BASE'] | 
-                   map('regex_replace', '^(true|false)$', '\1') | 
-                   list | 
-                   to_json }}
-            validate_certs: no
-            status_code: 200
-          when: "'ranger' in normalized_services"
-          no_log: true
-          register: ranger_role_config_update
-          retries: 3
-          delay: 10
-
-        # Other role-level configs (Oozie, NiFi, etc.)
-        - name: Update role-level configs
+        - name: Update role-level configs (Oozie, NiFiRegistry, SQL Stream Builder)
           uri:
             url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[service_type][0] }}/roleConfigGroups/{{ service_config_map[service_type].role_group }}/config"
             method: PUT
@@ -130,33 +128,100 @@
               Authorization: "Bearer {{ cm_api_token }}"
             body_format: json
             body:
-              items: >-
-                {% if service_config_map[service_type] is mapping and service_config_map[service_type].config_key is defined %}
-                  [{
-                    "name": "{{ service_config_map[service_type].config_key }}",
-                    "value": "{{ service_config_map[service_type].password }}",
-                    "sensitive": true
-                  }]
-                {% else %}
-                  {{ service_config_map[service_type].configs | 
-                     map('regex_replace', '^(true|false)$', '\1') | 
-                     list | 
-                     to_json }}
-                {% endif %}
+              items: [{
+                name: "{{ service_config_map[service_type].config_key }}",
+                value: "{{ service_config_map[service_type].password }}",
+                sensitive: true
+              }]
             validate_certs: no
             status_code: 200
-          loop: "{{ ['oozie','nifi','nifiregistry','sqlstreambuilder'] | select('in', normalized_services.keys()) | list }}"
+          loop: "{{ ['oozie','nifiregistry','sqlstreambuilder'] | select('in', normalized_services.keys()) | list }}"
           loop_control:
             loop_var: service_type
           no_log: true
-          register: role_config_updates
           retries: 3
           delay: 10
 
       rescue:
         - name: Log configuration errors
           debug:
-            msg: "Error configuring {{ service_type if service_type is defined else 'ranger-RANGER_ADMIN' }} - {{ ansible_failed_result.msg }}"
+            msg: "Error configuring {{ service_type }} - {{ ansible_failed_result.msg }}"
           when: ansible_failed_result is defined
 
-    # [Rest of the playbook remains the same]
+    # 6. Update LDAP Bind Passwords
+    - name: Update LDAP Bind Passwords (Ranger, Atlas, NiFiRegistry, Hue, NiFi)
+      block:
+        - name: Update service-level LDAP configs
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[item.service_key][0] }}/config"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              items: [{
+                name: "{{ item.config_key }}",
+                value: "{{ item.password }}",
+                sensitive: true
+              }]
+            validate_certs: no
+            status_code: 200
+          loop: "{{ ldap_password_config_map | selectattr('type', 'equalto', 'service_level') | selectattr('service_key', 'in', normalized_services.keys()) | list }}"
+          loop_control:
+            label: "{{ item.service_key }}"
+          no_log: true
+          retries: 3
+          delay: 10
+
+        - name: Update role-level LDAP configs
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[item.service_key][0] }}/roleConfigGroups/{{ item.role_group }}/config"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              items: [{
+                name: "{{ item.config_key }}",
+                value: "{{ item.password }}",
+                sensitive: true
+              }]
+            validate_certs: no
+            status_code: 200
+          loop: "{{ ldap_password_config_map | rejectattr('type', 'equalto', 'service_level') | selectattr('service_key', 'in', normalized_services.keys()) | list }}"
+          loop_control:
+            label: "{{ item.service_key }}"
+          no_log: true
+          retries: 3
+          delay: 10
+
+    # 7. Update Reports Manager headlamp password
+    - name: Check for Reports Manager
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/cm/service"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cm_api_token }}"
+        validate_certs: no
+        status_code: 200
+      register: cm_service
+      no_log: true
+
+    - name: Update Reports Manager configuration
+      uri:
+        url: "https://{{ cm_host }}:7183/api/v40/cm/service/roleConfigGroups/reportsmanager-REPORTSMANAGER_SERVER-BASE/config"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ cm_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          items: [{
+            name: "headlamp_database_password",
+            value: "{{ primary_db_password }}",
+            sensitive: true
+          }]
+        validate_certs: no
+        status_code: 200
+      when: "'REPORTSMANAGER' in (cm_service.json.roles | map(attribute='type') | list)"
+      no_log: true
