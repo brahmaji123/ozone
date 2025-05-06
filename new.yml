@@ -1,0 +1,162 @@
+- name: Comprehensive Cloudera Manager Service Configuration Update
+  hosts: cm_server
+  vars_files:
+    - ../inventories/production/group_vars/cm_servers.yml
+  vars:
+    primary_db_password: "{{ vault_primary_db_password }}"
+    secondary_db_password: "{{ vault_secondary_db_password }}"
+    ldap_bind_password: "{{ vault_ldap_bind_password }}"
+
+  tasks:
+    # [Previous tasks remain the same until service_config_map]
+    
+    # 4. Service configuration mapping
+    - name: Set service configuration mapping
+      set_fact:
+        service_config_map: {
+          'hive': {'type': 'service_level', 'config_key': 'hive_metastore_database_password', 'password': '{{ primary_db_password }}'},
+          'hue': {
+            'type': 'service_level', 
+            'configs': [
+              {'key': 'database_password', 'value': '{{ primary_db_password }}'},
+              {'key': 'ldap_bind_password', 'value': '{{ ldap_bind_password }}'}
+            ]
+          },
+          'ranger': {
+            'service_level_configs': [
+              {'key': 'db_password', 'value': '{{ secondary_db_password }}'}
+            ],
+            'role_level_configs': {
+              'ranger-RANGER_ADMIN-BASE': [
+                {'key': 'ranger_ldap_bind_password', 'value': '{{ ldap_bind_password }}'}
+              ]
+            }
+          },
+          'rangerkms': {'type': 'service_level', 'config_key': 'db_password', 'password': '{{ secondary_db_password }}'},
+          'yarn': {'type': 'service_level', 'config_key': 'yarn_resourcemanager_store_password', 'password': '{{ primary_db_password }}'},
+          'oozie': {'type': 'role_level', 'config_key': 'oozie_database_password', 'password': '{{ primary_db_password }}', 'role_group': 'oozie-OOZIE_SERVER-BASE'},
+          'nifi': {
+            'type': 'role_level', 
+            'role_group': 'nifi-NIFI_NODE-BASE',
+            'configs': [
+              {'key': 'nifi.security.identity.mapping.pattern.dn', 'value': 'CN=([^,]+)', 'sensitive': false},
+              {'key': 'nifi.security.identity.mapping.value.dn', 'value': '$1', 'sensitive': false},
+              {'key': 'nifi.security.identity.mapping.transform.dn', 'value': 'UPPER', 'sensitive': false},
+              {'key': 'nifi.security.user.login.identity.provider', 'value': 'ldap-provider', 'sensitive': false},
+              {'key': 'nifi.security.user.authorizer', 'value': 'managed-authorizer', 'sensitive': false},
+              {'key': 'nifi.security.user.ldap.bind.password', 'value': '{{ ldap_bind_password }}', 'sensitive': true}
+            ]
+          },
+          'nifiregistry': {
+            'type': 'role_level', 
+            'configs': [
+              {'key': 'nifi.registry.db.password', 'value': '{{ secondary_db_password }}'},
+              {'key': 'nifi.registry.security.identity.provider.ldap.bind.password', 'value': '{{ ldap_bind_password }}'}
+            ],
+            'role_group': 'nifiregistry-NIFI_REGISTRY_SERVER-BASE'
+          },
+          'sqlstreambuilder': {'type': 'role_level', 'config_key': 'spring.datasource.password', 'password': '{{ primary_db_password }}', 'role_group': 'sqlstreambuilder-SQL_STREAM_BUILDER_SERVER-BASE'}
+        }
+      no_log: true
+
+    # 5. Update service configurations
+    - name: Update service configurations
+      block:
+        # Standard service-level configs (Hive, Hue, Ranger DB password, etc.)
+        - name: Update service-level configs
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[service_type][0] }}/config"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              items: >-
+                {% if service_config_map[service_type] is mapping and service_config_map[service_type].config_key is defined %}
+                  [{
+                    "name": "{{ service_config_map[service_type].config_key }}",
+                    "value": "{{ service_config_map[service_type].password }}",
+                    "sensitive": true
+                  }]
+                {% elif service_config_map[service_type].service_level_configs is defined %}
+                  {{ service_config_map[service_type].service_level_configs | 
+                     map('regex_replace', '^(true|false)$', '\1') | 
+                     list | 
+                     to_json }}
+                {% elif service_config_map[service_type].configs is defined %}
+                  {{ service_config_map[service_type].configs | 
+                     map('regex_replace', '^(true|false)$', '\1') | 
+                     list | 
+                     to_json }}
+                {% endif %}
+            validate_certs: no
+            status_code: 200
+          loop: "{{ ['hive','hue','ranger','rangerkms','yarn'] | select('in', normalized_services.keys()) | list }}"
+          loop_control:
+            loop_var: service_type
+          no_log: true
+          register: service_config_updates
+          retries: 3
+          delay: 10
+
+        # Ranger role-level config (LDAP bind password)
+        - name: Update Ranger role-level LDAP config
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services['ranger'][0] }}/roleConfigGroups/ranger-RANGER_ADMIN-BASE/config"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              items: >-
+                {{ service_config_map['ranger'].role_level_configs['ranger-RANGER_ADMIN-BASE'] | 
+                   map('regex_replace', '^(true|false)$', '\1') | 
+                   list | 
+                   to_json }}
+            validate_certs: no
+            status_code: 200
+          when: "'ranger' in normalized_services"
+          no_log: true
+          register: ranger_role_config_update
+          retries: 3
+          delay: 10
+
+        # Other role-level configs (Oozie, NiFi, etc.)
+        - name: Update role-level configs
+          uri:
+            url: "https://{{ cm_host }}:7183/api/v40/clusters/{{ cluster_name }}/services/{{ normalized_services[service_type][0] }}/roleConfigGroups/{{ service_config_map[service_type].role_group }}/config"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cm_api_token }}"
+            body_format: json
+            body:
+              items: >-
+                {% if service_config_map[service_type] is mapping and service_config_map[service_type].config_key is defined %}
+                  [{
+                    "name": "{{ service_config_map[service_type].config_key }}",
+                    "value": "{{ service_config_map[service_type].password }}",
+                    "sensitive": true
+                  }]
+                {% else %}
+                  {{ service_config_map[service_type].configs | 
+                     map('regex_replace', '^(true|false)$', '\1') | 
+                     list | 
+                     to_json }}
+                {% endif %}
+            validate_certs: no
+            status_code: 200
+          loop: "{{ ['oozie','nifi','nifiregistry','sqlstreambuilder'] | select('in', normalized_services.keys()) | list }}"
+          loop_control:
+            loop_var: service_type
+          no_log: true
+          register: role_config_updates
+          retries: 3
+          delay: 10
+
+      rescue:
+        - name: Log configuration errors
+          debug:
+            msg: "Error configuring {{ service_type if service_type is defined else 'ranger-RANGER_ADMIN' }} - {{ ansible_failed_result.msg }}"
+          when: ansible_failed_result is defined
+
+    # [Rest of the playbook remains the same]
