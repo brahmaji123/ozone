@@ -1,76 +1,67 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 from concurrent.futures import ThreadPoolExecutor
-import time
 
-# Ranger API configuration
-RANGER_URL = "http://your-ranger-server:6080"
-AUTH = ("admin", "admin")  # Replace with your credentials
-POLICY_API = f"{RANGER_URL}/service/public/v2/api/policy"
+# === Config ===
+RANGER_URL = 'http://<ranger-host>:6080'
+USERNAME = 'admin'
+PASSWORD = 'admin'
+POLICIES_FILE = 'policies.json'  # JSON list of 100k policies
+BATCH_SIZE = 100  # Adjust based on server tolerance
+MAX_WORKERS = 10  # Parallel threads
 
-# Headers for API requests
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json"
-}
+# === HTTP Session with Retries ===
+def get_session():
+    session = requests.Session()
+    retries = Retry(total=5, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
+    session.mount('http://', adapter)
+    session.auth = (USERNAME, PASSWORD)
+    session.headers.update({'Content-Type': 'application/json'})
+    return session
 
-def import_policy(policy_data):
-    """Import a single policy into Ranger"""
-    try:
-        response = requests.post(
-            POLICY_API,
-            data=json.dumps(policy_data),
-            headers=HEADERS,
-            auth=AUTH
-        )
-        
+# === Load policies ===
+with open(POLICIES_FILE, 'r') as f:
+    policies = json.load(f)
+
+# === Batch the policies ===
+def batch(iterable, n):
+    """Yield successive n-sized batches from iterable"""
+    for i in range(0, len(iterable), n):
+        yield iterable[i:i + n]
+
+# === Upload a batch ===
+def upload_batch(batch_policies):
+    session = get_session()
+    successes, failures = 0, 0
+    for policy in batch_policies:
+        service_name = policy.get('service')  # required
+        url = f"{RANGER_URL}/service/public/v2/api/policy"
+        response = session.post(url, json=policy)
         if response.status_code in (200, 201):
-            return True
+            successes += 1
         else:
-            print(f"Failed to import policy {policy_data.get('name')}: {response.text}")
-            return False
-            
-    except Exception as e:
-        print(f"Error importing policy {policy_data.get('name')}: {str(e)}")
-        return False
+            failures += 1
+            print(f"Failed to create policy: {response.status_code} - {response.text}")
+    return successes, failures
 
-def batch_import_policies(policies, batch_size=100, max_workers=10):
-    """Import policies in batches with parallel processing"""
-    success_count = 0
-    failure_count = 0
-    
-    # Process in batches to avoid memory issues
-    for i in range(0, len(policies), batch_size):
-        batch = policies[i:i + batch_size]
-        
-        # Use thread pool for parallel processing within the batch
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(import_policy, batch))
-        
-        # Update counts
-        success_count += sum(results)
-        failure_count += len(results) - sum(results)
-        
-        print(f"Processed batch {i//batch_size + 1}: {success_count} success, {failure_count} failures")
-        
-        # Small delay between batches to avoid overwhelming the server
-        time.sleep(1)
-    
-    return success_count, failure_count
+# === Parallel uploader ===
+def main():
+    batches = list(batch(policies, BATCH_SIZE))
+    total_success, total_fail = 0, 0
 
-# Main execution
-if __name__ == "__main__":
-    # Load your policies from JSON file
-    with open('policies.json') as f:
-        all_policies = json.load(f)
-    
-    print(f"Starting import of {len(all_policies)} policies...")
-    
-    # Adjust batch_size and max_workers based on your Ranger server capacity
-    success, failures = batch_import_policies(
-        all_policies,
-        batch_size=200,  # Number of policies per batch
-        max_workers=20   # Concurrent requests per batch
-    )
-    
-    print(f"Import completed. Success: {success}, Failures: {failures}")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(upload_batch, b) for b in batches]
+        for future in futures:
+            success, fail = future.result()
+            total_success += success
+            total_fail += fail
+
+    print(f"✅ Successfully imported {total_success} policies")
+    if total_fail > 0:
+        print(f"❌ Failed to import {total_fail} policies")
+
+if __name__ == '__main__':
+    main()
