@@ -8,20 +8,23 @@ def move_roles_to_groups(input_file, output_file):
         raise ValueError("Expected a list at the top level of JSON")
 
     for entry in data:
+        # Safely handle missing keys
         roles = entry.get("roles", [])
         groups = set(entry.get("groups", []))
 
-        # Move roles into groups
+        # Move each role to the groups list
         for role in roles:
             groups.add(role)
 
+        # Update the entry
         entry["groups"] = sorted(groups)
-        entry["roles"] = []  # Clear roles
+        entry["roles"] = []  # Clear the roles
 
+    # Write updated JSON to output file
     with open(output_file, 'w') as f:
         json.dump(data, f, indent=2)
 
-    print(f"✅ Roles moved to groups in all entries. Output: {output_file}")
+    print(f"✅ Done! Roles moved to groups. Output written to: {output_file}")
 
-# Run it
+# Example usage
 move_roles_to_groups("export.json", "export_tagged.json")
