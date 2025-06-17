@@ -11,21 +11,24 @@ for policy in policies:
         continue  # Skip non-cm_hive services
 
     resources = policy.get("resources", {})
-    url = resources.get("url", {})
-    values = url.get("values", [])
+    
+    # Only process if 'url' exists in 'resources'
+    if "url" in resources:
+        url_obj = resources["url"]
+        values = url_obj.get("values", [])
 
-    new_values = []
-    for val in values:
-        # Replace '/schemas/' with '/datafiles/' and remove '.db' from end
-        updated = val.replace("/schemas/", "/datafiles/")
-        updated = re.sub(r'\.db$', '', updated)
-        new_values.append(updated)
+        new_values = []
+        for val in values:
+            # Replace '/schemas/' with '/datafiles/' and remove trailing '.db'
+            updated = val.replace("/schemas/", "/datafiles/")
+            updated = re.sub(r'\.db$', '', updated)
+            new_values.append(updated)
 
-    # Update values only if we made a change
-    policy["resources"]["url"]["values"] = new_values
+        # Update the values
+        policy["resources"]["url"]["values"] = new_values
 
-# Save updated JSON
+# Save updated policies
 with open("ranger_policies_updated.json", "w") as outfile:
     json.dump(policies, outfile, indent=4)
 
-print("Finished updating cm_hive policies.")
+print("✅ Finished updating cm_hive policies with URL paths.")
