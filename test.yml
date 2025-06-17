@@ -1,10 +1,59 @@
-body:
-              items: "{{ service_configs | selectattr('type', 'equalto', 'service_level') | 
-                        map(attribute='config_key') | 
-                        zip(service_configs | selectattr('type', 'equalto', 'service_level') | 
-                            map(attribute='password')) |
-                        map('community.general.dict_kv', 'name', 'value') |
-                        map('combine', {'sensitive': true}) |
-                        list }}"
-            validate_certs: no
-            status_code: 200
+import json
+import re
+
+def convert_schema_to_datafile(path):
+    if "/schemas/" in path:
+        path = path.replace("/schemas/", "/datafiles/")
+        path = re.sub(r"\.db$", "", path)
+    return path
+
+# Load input JSON file
+with open("ranger_policies.json", "r") as infile:
+    policies = json.load(infile)
+
+changed_count = 0
+log_entries = []
+
+# Process each policy
+for policy in policies:
+    if policy.get("service") != "cm_hive":
+        continue
+
+    resources = policy.get("resources", {})
+    url_obj = resources.get("url")
+    if not url_obj:
+        continue
+
+    original_values = url_obj.get("values", [])
+    new_values_set = set()
+
+    for val in original_values:
+        if "/schemas/" in val:
+            val = convert_schema_to_datafile(val)
+        new_values_set.add(val)
+
+    new_values = sorted(new_values_set)
+
+    if set(original_values) != set(new_values):
+        # Log the change
+        changed_count += 1
+        log_entries.append({
+            "policyName": policy.get("name"),
+            "original": original_values,
+            "updated": new_values
+        })
+
+        # Apply the update
+        policy["resources"]["url"]["values"] = new_values
+
+# Write the updated policies
+with open("ranger_policies_updated.json", "w") as outfile:
+    json.dump(policies, outfile, indent=4)
+
+# Optionally write the log file
+with open("policy_update_log.json", "w") as logfile:
+    json.dump(log_entries, logfile, indent=4)
+
+# Print summary
+print(f"✅ Total policies updated: {changed_count}")
+print("📝 Detailed log saved to: policy_update_log.json")
