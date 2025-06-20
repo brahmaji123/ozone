@@ -36,6 +36,24 @@ def log(message):
     with open(LOG_PATH, 'a') as log_file:
         log_file.write(f"[{timestamp}] {message}\n")
 
+# --- Determine relevant config keys ---
+def is_relevant_password_key(key):
+    key_l = key.lower()
+    return (
+        ("keystore" in key_l and "password" in key_l) or
+        ("private_key" in key_l and "password" in key_l) or
+        key_l in [
+            "ssl_private_key_password",
+            "ssl_server_keystore_password",
+            "ssl_client_keystore_password",
+            "ranger.ssl.keystore.password",
+            "ranger.kms.keystore.password",
+            "hive.ssl.keystore.password",
+            "rangerkms.ssl.keystore.password",
+            "impala.ssl_private_key_password"
+        ]
+    )
+
 # --- CM API calls ---
 def get_services():
     r = requests.get(f"{BASE_URL}/clusters/{CLUSTER_NAME}/services", auth=auth)
@@ -87,7 +105,7 @@ def main():
             updates = {}
             for item in config.get("items", []):
                 key = item.get("name")
-                if key and "keystore" in key.lower() and "password" in key.lower():
+                if key and is_relevant_password_key(key):
                     updates[key] = NEW_PASSWORD
             if updates:
                 log(f" → {'Would update' if DRY_RUN else 'Updated'} service config: {updates}")
@@ -105,7 +123,7 @@ def main():
                 rg_updates = {}
                 for item in rg_config.get("items", []):
                     key = item.get("name")
-                    if key and "keystore" in key.lower() and "password" in key.lower():
+                    if key and is_relevant_password_key(key):
                         rg_updates[key] = NEW_PASSWORD
                 if rg_updates:
                     log(f" → {'Would update' if DRY_RUN else 'Updated'} role group '{rg_name}': {rg_updates}")
