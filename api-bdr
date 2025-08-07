@@ -1,0 +1,26 @@
+curl -X POST \
+  -u "admin:admin_password" \
+  "http://<CM-HOST>:7180/api/v40/clusters/<source-cluster>/replication/hdfsPolicies" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "hdfs-bdr-policy",
+    "sourceService": {
+      "clusterName": "<source-cluster>",
+      "serviceName": "HDFS"
+    },
+    "sourcePath": "/user/data",
+    "destinationService": {
+      "clusterName": "<target-cluster>",
+      "serviceName": "HDFS"
+    },
+    "destinationPath": "/user/data-backup",
+    "scheduleInterval": {
+      "unit": "HOURS",
+      "value": 6
+    },
+    "startTime": "2025-08-07T00:00:00.000Z",
+    "deletePolicy": "KEEP_DELETED_FILES",
+    "logPath": "/user/logs/hdfs-bdr",
+    "runAs": "hdfs",
+    "mapreduceServiceName": "YARN"
+  }'
