@@ -1,0 +1,32 @@
+import org.apache.spark.sql.functions._
+
+// Read your dataset
+val df = spark.read.parquet("hdfs:///path/to/hdfs/dir")
+
+// Count total & string columns
+val totalCols = df.columns.length
+val stringCols = df.dtypes.filter(_._2 == "StringType").map(_._1)
+
+println(s"✅ Total columns: $totalCols")
+println(s"✅ String columns: ${stringCols.length}")
+
+// (Optional) take a 1% sample if dataset is huge
+val sampleDf = df.sample(0.01)
+
+// Compute max string length for each string column
+val colMaxLens = stringCols.map { colName =>
+  val maxLen = sampleDf
+    .select(length(col(colName)).as("len"))
+    .agg(max("len"))
+    .first()
+    .getInt(0)
+  (colName, maxLen)
+}
+
+// Sort by max length (descending) and take top 5
+val topCols = colMaxLens.sortBy(-_._2).take(5)
+
+println("\n📌 Top 5 String columns by observed max length (sampled):")
+topCols.foreach { case (colName, len) =>
+  println(s"  - $colName : $len chars")
+}
